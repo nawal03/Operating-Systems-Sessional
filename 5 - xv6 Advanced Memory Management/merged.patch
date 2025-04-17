@@ -1,0 +1,1236 @@
+diff --git a/Makefile b/Makefile
+index 39a99d7..0f18ae5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -24,6 +24,7 @@ OBJS = \
+   $K/sleeplock.o \
+   $K/file.o \
+   $K/pipe.o \
++  $K/swap.o \
+   $K/exec.o \
+   $K/sysfile.o \
+   $K/kernelvec.o \
+@@ -132,6 +133,10 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_test\
++	$U/_test2\
++	$U/_test3\
++
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..ec63826 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -8,6 +8,7 @@ struct spinlock;
+ struct sleeplock;
+ struct stat;
+ struct superblock;
++struct swap;
+ 
+ // bio.c
+ void            binit(void);
+@@ -36,6 +37,8 @@ int             filewrite(struct file*, uint64, int n);
+ 
+ // fs.c
+ void            fsinit(int);
++uint            balloc(uint dev);
++void            bfree(int dev, uint b);
+ int             dirlink(struct inode*, char*, uint);
+ struct inode*   dirlookup(struct inode*, char*, uint*);
+ struct inode*   ialloc(uint, short);
+@@ -63,6 +66,10 @@ void            ramdiskrw(struct buf*);
+ void*           kalloc(void);
+ void            kfree(void *);
+ void            kinit(void);
++void            add_ref(uint64);
++void            remove_ref(uint64);
++int             free_pg(void);
++
+ 
+ // log.c
+ void            initlog(int, struct superblock*);
+@@ -106,6 +113,19 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            pgstat(void);
++
++// swap.c
++void            swapinit(void);
++void            swapfree(struct swap*);
++struct swap*    swapalloc(void);
++void            swapout(struct swap *dst_sp, char *src_pa);
++void            swapin(char *dst_pa, struct swap *src_sp);
++void            livepginit(void);
++void            addpage(pagetable_t pagetable,uint64 va, uint64 pa);
++void            rempage(uint64 pa);
++void            moveout(void);
++void            movein(pagetable_t pagetable, uint64 va);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -173,6 +193,7 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             copypage(pagetable_t,uint64);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/fs.c b/kernel/fs.c
+index c6bab15..2d9b419 100644
+--- a/kernel/fs.c
++++ b/kernel/fs.c
+@@ -62,7 +62,7 @@ bzero(int dev, int bno)
+ 
+ // Allocate a zeroed disk block.
+ // returns 0 if out of disk space.
+-static uint
++uint
+ balloc(uint dev)
+ {
+   int b, bi, m;
+@@ -88,7 +88,7 @@ balloc(uint dev)
+ }
+ 
+ // Free a disk block.
+-static void
++void
+ bfree(int dev, uint b)
+ {
+   struct buf *bp;
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..d8422e8 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -21,11 +21,14 @@ struct run {
+ struct {
+   struct spinlock lock;
+   struct run *freelist;
++  int ref_count[(PHYSTOP>>PGSHIFT)];
++  int free_pg_count;
+ } kmem;
+ 
+ void
+ kinit()
+ {
++  kmem.free_pg_count=0;
+   initlock(&kmem.lock, "kmem");
+   freerange(end, (void*)PHYSTOP);
+ }
+@@ -35,8 +38,14 @@ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint64)pa_start);
++  
+   for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+     kfree(p);
++
++}
++
++int index(uint64 pa){
++    return pa>>PGSHIFT;
+ }
+ 
+ // Free the page of physical memory pointed at by pa,
+@@ -51,6 +60,14 @@ kfree(void *pa)
+   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+     panic("kfree");
+ 
++  remove_ref((uint64)pa);
++  acquire(&kmem.lock);
++  if(kmem.ref_count[index((uint64)pa)]>0){
++    release(&kmem.lock);
++    return;
++  }
++  release(&kmem.lock);
++
+   // Fill with junk to catch dangling refs.
+   memset(pa, 1, PGSIZE);
+ 
+@@ -59,7 +76,10 @@ kfree(void *pa)
+   acquire(&kmem.lock);
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++  kmem.free_pg_count++;
+   release(&kmem.lock);
++
++  rempage((uint64) pa);
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -72,11 +92,37 @@ kalloc(void)
+ 
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  
++  if(r){
++    kmem.ref_count[index((uint64)r)] = 1;
+     kmem.freelist = r->next;
++    kmem.free_pg_count--;
++  }
++
+   release(&kmem.lock);
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
++
+   return (void*)r;
+ }
++
++void add_ref(uint64 pa){
++  acquire(&kmem.lock);
++  kmem.ref_count[index(pa)]++;
++  release(&kmem.lock);
++}
++
++void remove_ref(uint64 pa){
++  acquire(&kmem.lock);
++  if(kmem.ref_count[index(pa)]>0)
++    kmem.ref_count[index(pa)]--;
++  release(&kmem.lock);
++
++}
++
++//number of free pages in freelist
++int
++free_pg(void){
++  return kmem.free_pg_count;
++}
+\ No newline at end of file
+diff --git a/kernel/main.c b/kernel/main.c
+index f0d3171..28453f1 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -29,6 +29,8 @@ main()
+     fileinit();      // file table
+     virtio_disk_init(); // emulated hard disk
+     userinit();      // first user process
++    livepginit();
++    swapinit();
+     __sync_synchronize();
+     started = 1;
+   } else {
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 959b778..27b040d 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -287,13 +287,13 @@ fork(void)
+   if((np = allocproc()) == 0){
+     return -1;
+   }
+-
++  release(&np->lock);
+   // Copy user memory from parent to child.
+   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+     freeproc(np);
+-    release(&np->lock);
+     return -1;
+   }
++  acquire(&np->lock);
+   np->sz = p->sz;
+ 
+   // copy saved user registers.
+@@ -414,9 +414,9 @@ wait(uint64 addr)
+             release(&wait_lock);
+             return -1;
+           }
+-          freeproc(pp);
+           release(&pp->lock);
+           release(&wait_lock);
++          freeproc(pp);
+           return pid;
+         }
+         release(&pp->lock);
+@@ -681,3 +681,20 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++void 
++pgstat(void){
++  struct proc *p;
++  printf("\n=====printing page stat=====\n");
++  for(p = proc; p < &proc[NPROC]; p++){
++    if(p->state == UNUSED)
++      continue;
++    acquire(&p->lock);
++    printf("pid: %d     page count: %d\n", p->pid, p->sz/PGSIZE);
++    printf("\n");
++    release(&p->lock);
++  }
++
++  printf("total unused pg: %d\n",free_pg());
++  printf("\n============================\n");
++}
+\ No newline at end of file
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..49b902f 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -334,6 +334,7 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ 
+ #define PGSIZE 4096 // bytes per page
+ #define PGSHIFT 12  // bits of offset within a page
++#define MAXPHYPAGE 50
+ 
+ #define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
+ #define PGROUNDDOWN(a) (((a)) & ~(PGSIZE-1))
+@@ -343,6 +344,8 @@ typedef uint64 *pagetable_t; // 512 PTEs
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // user can access
++#define PTE_COW (1L << 8) // user can access
++#define PTE_SWP (1L << 9)
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/swap.c b/kernel/swap.c
+new file mode 100644
+index 0000000..ee5312b
+--- /dev/null
++++ b/kernel/swap.c
+@@ -0,0 +1,258 @@
++#include "types.h"
++#include "riscv.h"
++#include "fs.h"
++#include "spinlock.h"
++#include "defs.h"
++#include "param.h"
++#include "sleeplock.h"
++#include "buf.h"
++#include "memlayout.h"
++
++#define NBLOCKPERPAGE (PGSIZE / BSIZE)
++
++struct swap {
++  uint blocknos[NBLOCKPERPAGE];
++};
++
++struct run {
++  struct run *next;
++};
++
++struct {
++  struct spinlock lock;
++  struct run *freelist;
++} swapmem;
++
++struct page{
++  pagetable_t pagetable;
++  uint64      va;
++  uint64      pa;
++  uint64      seq;
++  int         valid;
++};
++
++struct spinlock livelock;
++struct page livepages[MAXPHYPAGE];
++int seq;
++int livecount;
++
++// Initialize swapmem
++void
++swapinit(void)
++{
++  initlock(&swapmem.lock, "swapmem");
++  swapmem.freelist = 0;
++}
++
++// Allocate one swap struct.
++// Returns a pointer to the swap struct.
++// Returns 0 if the memory cannot be allocated.
++struct swap *
++swapalloc(void)
++{
++  struct run *r;
++  struct swap *s;
++
++  acquire(&swapmem.lock);
++  r = swapmem.freelist;
++  if(!r){
++    release(&swapmem.lock);
++    char *mem = kalloc();
++    char *mem_end = mem + PGSIZE;
++    for(; mem + sizeof(struct swap) <= mem_end; mem += sizeof(struct swap)){
++      r = (struct run*)mem;
++
++      acquire(&swapmem.lock);
++      r->next = swapmem.freelist;
++      swapmem.freelist = r;
++      release(&swapmem.lock);
++    }
++    acquire(&swapmem.lock);
++    r = swapmem.freelist;
++  }
++  swapmem.freelist = r->next;
++  release(&swapmem.lock);
++  
++  s = (struct swap*)r;
++  if(s)
++    memset((char*)s->blocknos, 0, sizeof(s->blocknos)); // fill with zeros
++  
++  return s;
++}
++
++// Free the swap struct pointed by s, and the blocks
++// contained in s, which normally should have been returned
++// by a call to swapalloc() and swapout().
++void
++swapfree(struct swap *s)
++{
++  uint *blockno;
++  struct run *r;
++
++  if(!s)
++    panic("swapfree");
++  
++  begin_op();
++  for(blockno = s->blocknos; blockno < &s->blocknos[NBLOCKPERPAGE]; blockno++){
++    if(*blockno)
++      bfree(ROOTDEV, *blockno);
++  }
++  end_op();
++
++  r = (struct run*)s;
++
++  acquire(&swapmem.lock);
++  r->next = swapmem.freelist;
++  swapmem.freelist = r;
++  release(&swapmem.lock);
++}
++
++// Swap out a given physical page src_pa to disk.
++// The metadata for retriving src_pa will be saved
++// to dst_pa which normally should have been returned
++// by a call to swapalloc().
++void
++swapout(struct swap *dst_sp, char *src_pa)
++{
++  uint *blockno;
++  struct buf *bp;
++  
++  begin_op();
++  for(blockno = dst_sp->blocknos; blockno < &dst_sp->blocknos[NBLOCKPERPAGE]; blockno++, src_pa += BSIZE){
++    *blockno = balloc(ROOTDEV);
++    if(*blockno == 0)
++      panic("swapout");
++    bp = bread(ROOTDEV, *blockno);
++    memmove(bp->data, src_pa, BSIZE);
++    log_write(bp);
++    brelse(bp);
++  }
++  end_op();
++}
++
++// Swap in a page into dst_pa from disk using src_sp.
++// src_sp should normally be updated with metadata
++// for retriving the page by a call to swapout().
++void
++swapin(char *dst_pa, struct swap *src_sp)
++{
++  uint *blockno;
++  struct buf *bp;
++  
++  if(!dst_pa)
++    panic("swapin");
++  for(blockno = src_sp->blocknos; blockno < &src_sp->blocknos[NBLOCKPERPAGE]; blockno++, dst_pa += BSIZE){
++    bp = bread(ROOTDEV, *blockno);
++    memmove(dst_pa, bp->data, BSIZE);
++    brelse(bp);
++  }
++}
++
++
++// Initialize live pages
++void 
++livepginit(void){
++  initlock(&livelock,"livepages");
++  for(int i=0;i<MAXPHYPAGE;i++){
++    livepages[i].valid=0;
++  }
++  seq=0;
++  livecount=0;
++}
++
++void 
++addpage(pagetable_t pagetable,uint64 va, uint64 pa){
++  acquire(&livelock);
++  if(livecount == MAXPHYPAGE) {
++    release(&livelock);
++    moveout();
++    acquire(&livelock);
++  }
++  for(int i=0;i<MAXPHYPAGE;i++){
++    if(livepages[i].valid==0){
++      livepages[i].valid=1;
++      livepages[i].pagetable=pagetable;
++      livepages[i].va=va;
++      livepages[i].pa=pa;
++      livepages[i].seq=++seq;
++      livecount++;
++      release(&livelock);
++      return;
++    }
++  }
++  panic("no page to swap");
++  return;
++}
++
++void rempage(uint64 pa){
++  acquire(&livelock);
++  for(int i=0;i<MAXPHYPAGE;i++){
++    if(livepages[i].valid && livepages[i].pa == pa){
++      livepages[i].valid=0;
++      livecount--;
++      break;
++    }
++  }
++  release(&livelock);
++}
++
++void 
++moveout(void){
++  acquire(&livelock);
++  int min=(1<<31);
++  int idx=0;
++  for(int i=0;i<MAXPHYPAGE;i++){
++    if(livepages[i].valid){
++      pte_t *pte = walk(livepages[i].pagetable, livepages[i].va, 0);
++      if(livepages[i].seq<min && (*pte & PTE_COW) == 0){
++        min=livepages[i].seq;
++        idx=i;
++      }
++    }
++  }
++  
++  if(min == (1<<31)){
++    release(&livelock);
++    return;
++  }
++
++  pagetable_t pagetable = livepages[idx].pagetable;
++  uint64 va = livepages[idx].va;
++  release(&livelock);
++
++  pte_t *pte = walk(pagetable,va,0);
++
++
++  uint64 flags  = PTE_FLAGS(*pte);
++  flags &= ~PTE_V;
++  flags |= PTE_SWP;
++
++  struct swap *s = swapalloc();
++  swapout(s, (char *)livepages[idx].pa);
++  kfree((void *)PGROUNDDOWN(livepages[idx].pa));
++  *pte = (((uint64) s)<<10)|flags;
++  
++}
++
++
++void 
++movein(pagetable_t pagetable, uint64 va){
++  va = PGROUNDDOWN(va);
++  pte_t *pte = walk(pagetable,va,2);
++  
++  if(*pte & PTE_SWP){  
++    struct swap *s = (struct swap *)((*pte)>> 10);
++    char *mem = kalloc();
++    swapin(mem,s);
++    swapfree(s);
++
++    *pte |= PTE_V;
++    *pte &= ~PTE_SWP;
++    int flags = PTE_FLAGS(*pte);
++    *pte = 0;
++    mappages(pagetable,va,PGSIZE,(uint64) mem, flags);
++    addpage(pagetable,va,(uint64)mem);
++  }
++  return;
++}
++  
+\ No newline at end of file
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..5bb44fb 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_pgstat(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_pgstat]  sys_pgstat,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..bd1c840 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_pgstat 22
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 1de184e..59e1b31 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -89,3 +89,12 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++//prints the statistics for page usage: 
++//the number of pages being used by each running process
++//the number of pages in freelist
++uint64
++sys_pgstat(void){
++  pgstat();
++  return 0;
++}
+\ No newline at end of file
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..eb497d3 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -65,14 +65,55 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
+-  } else if((which_dev = devintr()) != 0){
++  }
++  else if(r_scause() == 15){
++    uint64 va = PGROUNDDOWN(r_stval());
++    if(va==0 || va>=MAXVA){
++      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
++      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
++      setkilled(p);
++      goto end;
++    }
++
++    pte_t *pte=walk(p->pagetable,va,0);
++    if(*pte & PTE_SWP)
++        movein(p->pagetable,va);
++
++    pte=walk(p->pagetable,va,0);
++    if(*pte & PTE_COW){
++      if(copypage(p->pagetable,r_stval())!=0){
++        printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
++        printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
++        setkilled(p);
++        goto end;
++      }
++    }
++  }
++  else if(r_scause()==13){
++    uint64 va = PGROUNDDOWN(r_stval());
++    if(va==0 || va>=MAXVA){
++      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
++      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
++      setkilled(p);
++      goto end;
++    }
++    pte_t *pte=walk(p->pagetable,va,0);
++    if(*pte & PTE_SWP)
++      movein(p->pagetable,va);
++    else{
++      printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
++      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
++      setkilled(p);
++    }
++  }
++  else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     setkilled(p);
+   }
+-
++  end:
+   if(killed(p))
+     exit(-1);
+ 
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 9f69783..09a0e03 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -179,11 +179,12 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+     if((pte = walk(pagetable, a, 0)) == 0)
+       panic("uvmunmap: walk");
+-    if((*pte & PTE_V) == 0)
++    if((*pte & PTE_V) == 0 && (*pte & PTE_SWP) == 0)
+       panic("uvmunmap: not mapped");
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+     if(do_free){
++      if(*pte & PTE_SWP) movein(pagetable,a);
+       uint64 pa = PTE2PA(*pte);
+       kfree((void*)pa);
+     }
+@@ -244,6 +245,9 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz, int xperm)
+       uvmdealloc(pagetable, a, oldsz);
+       return 0;
+     }
++    if((xperm & PTE_X)==0) {
++        addpage(pagetable, a, (uint64)mem) ;
++    }
+   }
+   return newsz;
+ }
+@@ -262,7 +266,6 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+     uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+   }
+-
+   return newsz;
+ }
+ 
+@@ -308,23 +311,26 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
++    if((*pte & PTE_V) == 0 && (*pte & PTE_SWP) == 0)
+       panic("uvmcopy: page not present");
++
++    if(*pte & PTE_SWP) movein(old, i);
++
+     pa = PTE2PA(*pte);
++    *pte |= PTE_COW;
++    *pte &= ~PTE_W;
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
++
++    if(mappages(new, i, PGSIZE, (uint64)pa, flags) != 0){
+       goto err;
+     }
++    add_ref((uint64) pa);
+   }
++  
+   return 0;
+ 
+  err:
+@@ -345,31 +351,38 @@ uvmclear(pagetable_t pagetable, uint64 va)
+   *pte &= ~PTE_U;
+ }
+ 
+-// Copy from kernel to user.
+-// Copy len bytes from src to virtual address dstva in a given page table.
+-// Return 0 on success, -1 on error.
+ int
+ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+   uint64 n, va0, pa0;
+-
+   while(len > 0){
+-    va0 = PGROUNDDOWN(dstva);
++    va0=PGROUNDDOWN(dstva);
++
++    pte_t *pte = walk(pagetable,va0,0);
++    if(*pte & PTE_SWP) movein(pagetable,va0);
++
++    pte = walk(pagetable,va0,0);
++    if(*pte & PTE_COW){
++      if(copypage(pagetable,va0)!=0) return -1;
++    }
++    
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+-      return -1;
++        return -1;
+     n = PGSIZE - (dstva - va0);
+     if(n > len)
+       n = len;
+     memmove((void *)(pa0 + (dstva - va0)), src, n);
+-
+     len -= n;
+     src += n;
+     dstva = va0 + PGSIZE;
++    
+   }
+   return 0;
+ }
+ 
++
++
+ // Copy from user to kernel.
+ // Copy len bytes to dst from virtual address srcva in a given page table.
+ // Return 0 on success, -1 on error.
+@@ -380,6 +393,10 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ 
+   while(len > 0){
+     va0 = PGROUNDDOWN(srcva);
++
++    pte_t *pte = walk(pagetable,va0,0);
++    if(*pte & PTE_SWP) movein(pagetable,va0);
++
+     pa0 = walkaddr(pagetable, va0);
+     if(pa0 == 0)
+       return -1;
+@@ -437,3 +454,34 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++//Return 0 is copying is successful 
++// Return -1 otherwise
++int copypage(pagetable_t pagetable, uint64 dstva){
++    uint64 va = PGROUNDDOWN(dstva);
++    if(va>=MAXVA || va==0) return -1;
++ 
++    pte_t *pte;
++    if((pte = walk(pagetable, va,0)) == 0) {
++      return -1;
++    }
++
++    uint flags = PTE_FLAGS(*pte);
++    flags &= ~PTE_COW;
++    flags |= PTE_W;
++
++    char *mem;
++    if((mem = kalloc()) == 0){
++      return -1;
++    }
++
++    uint64 pa = PTE2PA(*pte);
++    memmove(mem, (char*)pa, PGSIZE);
++    uvmunmap(pagetable, va, 1, 0);
++    if(mappages(pagetable, va, PGSIZE, (uint64)mem, flags) != 0){
++      return -1;
++    }
++    addpage(pagetable, va,(uint64) mem);
++    kfree((char *)pa);
++    return 0;
++}
+diff --git a/user/test.c b/user/test.c
+new file mode 100644
+index 0000000..a2b15dd
+--- /dev/null
++++ b/user/test.c
+@@ -0,0 +1,202 @@
++#include "kernel/types.h"
++#include "kernel/memlayout.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++void
++simpletest(){
++    printf("simpletest: ");
++    int sz = 100*4096;
++    char *p = sbrk(sz);
++    for(char *q = p; q < p + sz; q += 4096){
++    *(int*)q = 61;
++    }
++    for(char *q = p; q < p + sz; q += 4096){
++        if(*(int*)q != 61){
++            printf("wrong content\n");
++            exit(-1);
++        }
++    }
++    printf("ok\n");
++}
++
++// void
++// forktest()
++// {
++//   printf("forktest: ");
++//   int sz = 10*4096;
++//   int pid1,pid2;
++
++//   printf("BEFORE SBRK\n");
++//   pgstat();
++  
++//   char *p = sbrk(sz);
++//   if(p == (char*)0xffffffffffffffffL){
++//     printf("sbrk(%d) failed\n", sz);
++//     exit(-1);
++//   }
++  
++//   printf("BEFORE 1st fork\n");
++//   pgstat();
++//   pid1 = fork();
++//   if(pid1 < 0){
++//     printf("fork failed\n");
++//     exit(-1);
++//   }
++
++//   if(pid1 == 0){
++//     pid2 = fork();
++    
++//     if(pid2 < 0){
++//       printf("fork failed");
++//       exit(-1);
++//     }
++
++//     if(pid2 == 0){
++//       for(char *q = p; q < p + sz; q += 4096){
++//         *(int*)q = 61;
++//       }
++//       for(char *q = p; q < p + sz; q += 4096){
++//         if(*(int*)q != 61){
++//           printf("wrong content\n");
++//           exit(-1);
++//         }
++//       }
++      
++//       printf("AFTER 2nd fork\n");
++//       pgstat();
++      
++//       exit(0);
++//     }
++
++//     wait(0);
++
++//     for(char *q = p; q < p + sz; q += 4096){
++//         *(int*)q = 3377;
++//     }
++    
++//     for(char *q = p; q < p + sz; q += 4096){
++//         if(*(int*)q != 3377){
++//             printf("wrong content\n");
++//             exit(-1);
++//         }
++//     }
++//     printf("AFTER 1st fork\n");
++//     pgstat();
++//     exit(0);
++//   }
++
++//   wait(0);
++
++//   for(char *q = p; q < p + sz; q += 4096){
++//     *(int*)q = getpid();
++//   }
++
++//   for(char *q = p; q < p + sz; q += 4096){
++//     if(*(int*)q != getpid()){
++//       printf("wrong content\n");
++//       exit(-1);
++//     }
++//   }
++//   if(sbrk(-sz) == (char*)0xffffffffffffffffL){
++//     printf("sbrk(-%d) failed\n", sz);
++//     exit(-1);
++//   }
++//   printf("BEFORE exiting\n");
++//   pgstat();
++//   printf("ok\n");
++// }
++
++// int fds[2];
++// char buf[4096];
++
++// void filetest(){
++//     printf("filetest : ");
++//     buf[0] = 99;
++
++//   for(int i = 0; i < 4; i++){
++//     if(pipe(fds) != 0){
++//       printf("pipe() failed\n");
++//       exit(-1);
++//     }
++//     int pid = fork();
++//     if(pid < 0){
++//       printf("fork failed\n");
++//       exit(-1);
++//     }
++//     if(pid == 0){
++//       sleep(1);
++//       if(read(fds[0], buf, sizeof(i)) != sizeof(i)){
++//         printf("error: read failed\n");
++//         exit(1);
++//       }
++//       sleep(1);
++//       int j = *(int*)buf;
++//       if(j != i){ 
++//         printf("error: read the wrong value\n");
++//         exit(1);
++//       }
++//       exit(0);
++//     }
++//     if(write(fds[1], &i, sizeof(i)) != sizeof(i)){
++//       printf("error: write failed\n");
++//       exit(-1);
++//     }
++//   }
++
++//   int xstatus = 0;
++//   for(int i = 0; i < 4; i++) {
++//     wait(&xstatus);
++//     if(xstatus != 0) {
++//       exit(1);
++//     }
++//   }
++
++//   if(buf[0] != 99){
++//     printf("error: child overwrote parent\n");
++//     exit(1);
++//   }
++
++//   printf("ok\n");
++// }
++
++void
++filetest2(){
++  printf("filetest2 : ");
++  char *a = malloc(100*4096);
++  for (char *p = a; p < a + 409600; p++)
++  {
++    *p='a';
++  }
++  
++  int fd = open("file", O_CREATE|O_RDWR);
++  int n=write(fd, a, 4096);
++
++  char *b =(char *) (20*4096 + 30);
++  close(fd);
++  fd = open("file", O_RDWR);
++  int m=read(fd, b, 4096);
++
++  if(m!=4096 || n!=4096){
++    printf("Error\n");
++    exit(-1);
++  }
++  for(int i=0;i<4096;i++)
++  {
++    if(b[i]!='a'){
++      printf("Wrong Content");
++      exit(-1);
++    }
++  }
++  close(fd);
++  printf("ok\n");
++}
++
++int
++main(int argc, char *argv[])
++{
++  simpletest();
++  filetest2();
++  printf("ALL TESTS PASSED\n");
++  exit(0);
++}
+diff --git a/user/test2.c b/user/test2.c
+new file mode 100644
+index 0000000..c0b5c69
+--- /dev/null
++++ b/user/test2.c
+@@ -0,0 +1,101 @@
++#include "kernel/types.h"
++#include "kernel/memlayout.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++void
++forktest()
++{
++  printf("forktest: ");
++  int sz = 40*4096;
++  int pid1,pid2;
++
++  printf("BEFORE SBRK\n");
++  pgstat();
++  
++  char *p = sbrk(sz);
++  if(p == (char*)0xffffffffffffffffL){
++    printf("sbrk(%d) failed\n", sz);
++    exit(-1);
++  }
++  
++  printf("BEFORE 1st fork\n");
++  pgstat();
++  pid1 = fork();
++  if(pid1 < 0){
++    printf("fork failed\n");
++    exit(-1);
++  }
++
++  if(pid1 == 0){
++    pid2 = fork();
++    
++    if(pid2 < 0){
++      printf("fork failed");
++      exit(-1);
++    }
++
++    if(pid2 == 0){
++      for(char *q = p; q < p + sz; q += 4096){
++        *(int*)q = 61;
++      }
++      for(char *q = p; q < p + sz; q += 4096){
++        if(*(int*)q != 61){
++          printf("wrong content\n");
++          exit(-1);
++        }
++      }
++      
++      printf("AFTER 2nd fork\n");
++      pgstat();
++      
++      exit(0);
++    }
++
++    wait(0);
++
++    for(char *q = p; q < p + sz; q += 4096){
++        *(int*)q = 3377;
++    }
++    
++    for(char *q = p; q < p + sz; q += 4096){
++        if(*(int*)q != 3377){
++            printf("wrong content\n");
++            exit(-1);
++        }
++    }
++    printf("AFTER 1st fork\n");
++    pgstat();
++    exit(0);
++  }
++
++  wait(0);
++
++  for(char *q = p; q < p + sz; q += 4096){
++    *(int*)q = getpid();
++  }
++
++  for(char *q = p; q < p + sz; q += 4096){
++    if(*(int*)q != getpid()){
++      printf("wrong content\n");
++      exit(-1);
++    }
++  }
++  if(sbrk(-sz) == (char*)0xffffffffffffffffL){
++    printf("sbrk(-%d) failed\n", sz);
++    exit(-1);
++  }
++  printf("BEFORE exiting\n");
++  pgstat();
++  printf("ok\n");
++}
++
++
++
++int
++main(int argc, char *argv[])
++{
++  forktest();
++  printf("ALL TESTS PASSED\n");
++  exit(0);
++}
+diff --git a/user/test3.c b/user/test3.c
+new file mode 100644
+index 0000000..9a4cc67
+--- /dev/null
++++ b/user/test3.c
+@@ -0,0 +1,66 @@
++#include "kernel/types.h"
++#include "kernel/memlayout.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++int fds[2];
++char buf[4096];
++
++void filetest(){
++    printf("filetest : ");
++    buf[0] = 99;
++
++  for(int i = 0; i < 4; i++){
++    if(pipe(fds) != 0){
++      printf("pipe() failed\n");
++      exit(-1);
++    }
++    int pid = fork();
++    if(pid < 0){
++      printf("fork failed\n");
++      exit(-1);
++    }
++    if(pid == 0){
++      sleep(1);
++      if(read(fds[0], buf, sizeof(i)) != sizeof(i)){
++        printf("error: read failed\n");
++        exit(1);
++      }
++      sleep(1);
++      int j = *(int*)buf;
++      if(j != i){ 
++        printf("error: read the wrong value\n");
++        exit(1);
++      }
++      exit(0);
++    }
++    if(write(fds[1], &i, sizeof(i)) != sizeof(i)){
++      printf("error: write failed\n");
++      exit(-1);
++    }
++  }
++
++  int xstatus = 0;
++  for(int i = 0; i < 4; i++) {
++    wait(&xstatus);
++    if(xstatus != 0) {
++      exit(1);
++    }
++  }
++
++  if(buf[0] != 99){
++    printf("error: child overwrote parent\n");
++    exit(1);
++  }
++
++  printf("ok\n");
++}
++
++
++int
++main(int argc, char *argv[])
++{
++  filetest();
++  printf("ALL TESTS PASSED\n");
++  exit(0);
++}
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..ddc0138 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++void pgstat(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..f768266 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("pgstat");
