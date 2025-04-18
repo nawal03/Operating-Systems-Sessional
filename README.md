@@ -18,6 +18,7 @@ To apply any changes from this repository to the original xv6 codebase, use the 
 
 ```bash
 git apply /path/solution.patch
+```
 
 ## 📂 Contents
 
